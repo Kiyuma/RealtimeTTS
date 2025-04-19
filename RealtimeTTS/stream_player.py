@@ -69,12 +69,12 @@ else:
 class AudioConfiguration:
     def __init__(
         self,
-        format: int = pyaudio.paInt16 if not is_colab else 1,
+        format: int = pyaudio.paInt16 if not is_colab else 1, #Use dummy format if in Colab
         channels: int = 1,
         rate: int = 16000,
         output_device_index=None,
         muted: bool = False,
-        frames_per_buffer: int = pa.paFramesPerBufferUnspecified if not is_colab else 0,
+        frames_per_buffer: int = pa.paFramesPerBufferUnspecified if not is_colab else 0, #Adjust frames_per_buffer default for Colab
         playout_chunk_size: int = -1,
     ):
         self.format = format
@@ -94,7 +94,7 @@ class AudioStream:
     def __init__(self, config: AudioConfiguration):
         self.config = config
         self.stream = None
-        self.pyaudio_instance = pyaudio.PyAudio() if not is_colab else None
+        self.pyaudio_instance = pyaudio.PyAudio() if not is_colab else None #Skip PyAudio initialization in Colab
         self.actual_sample_rate = 0
         self.mpv_process = None
         self.is_colab = is_colab
@@ -190,7 +190,7 @@ class AudioStream:
 
     def open_stream(self):
         """Opens an audio stream."""
-        if self.is_colab:
+        if self.is_colab: #Bypass stream opening in Colab
           self.actual_sample_rate = self.config.rate
           return
 
@@ -431,7 +431,7 @@ class StreamPlayer:
         on_word_spoken=None,
         muted=False,
     ):
-        self.is_colab = is_colab
+        self.is_colab = is_colab #Add Colab detection and audio buffer
         self.buffer_manager = AudioBufferManager(audio_buffer, timings, config)
         self.timings = timings
         self.timings_list = []
@@ -447,7 +447,7 @@ class StreamPlayer:
         self.first_chunk_played = False
         self.muted = muted
         self.seconds_played = 0
-        self.colab_audio_buffer = io.BytesIO() if is_colab else None
+        self.colab_audio_buffer = io.BytesIO() if is_colab else None #Add Colab detection and audio buffer
       
     def _play_mpeg_chunk(self, chunk):
         """
@@ -569,7 +569,7 @@ class StreamPlayer:
         Args:
             chunk: Chunk of audio data to be played.
         """
-        if self.is_colab:
+        if self.is_colab: #Handle audio collection for Colab
             self.colab_audio_buffer.write(chunk)
             if self.on_audio_chunk:
                 self.on_audio_chunk(chunk)
@@ -637,7 +637,7 @@ class StreamPlayer:
             immediate (bool): If True, stops playback immediately
               without waiting for buffer to empty.
         """
-        if self.is_colab and self.colab_audio_buffer.tell() > 0:
+        if self.is_colab and self.colab_audio_buffer.tell() > 0: #Handle Colab audio playback on stop
             from IPython.display import Audio, display
             data = self.colab_audio_buffer.getvalue()
             try:
