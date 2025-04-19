@@ -15,50 +15,68 @@ Key Components:
 
 Designed for flexible, real-time audio playback and streaming, with error handling for unsupported configurations.
 """
-from pydub import AudioSegment
-try:
-    import pyaudio._portaudio as pa
-except ImportError:
-    print("Could not import the PyAudio C module 'pyaudio._portaudio'.")
-    raise
-import numpy as np
+import io
+import logging
+import queue
+import shutil
 import subprocess
 import threading
-import resampy
-import pyaudio
-import logging
-import shutil
-import queue
 import time
-import io
+from typing import Callable, Optional
 
+# Check if running in Google Colab
+is_colab = False
+try:
+    import google.colab
+    is_colab = True
+except ImportError:
+    pass
+
+if not is_colab:
+    from pydub import AudioSegment
+    try:
+        import pyaudio._portaudio as pa
+    except ImportError:
+        print("Could not import the PyAudio C module 'pyaudio._portaudio'.")
+        raise
+    import pyaudio
+    import resampy
+    import numpy as np
+else:
+    # Define dummy constants and classes for Colab
+    class DummyPyAudio:
+        paInt16 = 1
+        paCustomFormat = 2
+        paFloat32 = 3
+        paInt32 = 4
+        paInt24 = 5
+        paInt8 = 6
+        paUInt8 = 7
+        paFramesPerBufferUnspecified = 0
+
+        class PyAudio:
+            def __init__(self): pass
+            def open(self, *args, **kwargs): pass
+            def get_device_info_by_index(self, index): return {'maxOutputChannels': 2, 'defaultSampleRate': 44100}
+            def get_default_output_device_info(self): return {'index': 0}
+            def is_format_supported(self, *args, **kwargs): return True
+            def get_format_from_width(self, width): return 1
+
+    pa = DummyPyAudio()
+    pyaudio = DummyPyAudio()
+    import numpy as np
 
 class AudioConfiguration:
-    """
-    Defines the configuration for an audio stream.
-    """
-
     def __init__(
         self,
-        format: int = pyaudio.paInt16,
+        format: int = pyaudio.paInt16 if not is_colab else 1,
         channels: int = 1,
         rate: int = 16000,
         output_device_index=None,
         muted: bool = False,
-        frames_per_buffer: int = pa.paFramesPerBufferUnspecified,
+        frames_per_buffer: int = pa.paFramesPerBufferUnspecified if not is_colab else 0,
         playout_chunk_size: int = -1,
     ):
-        """
-        Args:
-            format (int): Audio format, typically one of PyAudio's predefined constants, e.g., pyaudio.paInt16 (default).
-            channels (int): Number of audio channels, e.g., 1 for mono or 2 for stereo. Defaults to 1 (mono).
-            rate (int): Sample rate of the audio stream in Hz. Defaults to 16000.
-            output_device_index (int): Index of the audio output device. If None, the default output device is used.
-            muted (bool): If True, audio playback is muted. Defaults to False.
-            frames_per_buffer (int): Number of frames per buffer for PyAudio. Defaults to pa.paFramesPerBufferUnspecified, letting PyAudio choose.
-            playout_chunk_size (int): Size of audio chunks (in bytes) to be played out. Defaults to -1, which determines the chunk size based on frames_per_buffer or a default value.
-
-        """
         self.format = format
         self.channels = channels
         self.rate = rate
@@ -67,7 +85,6 @@ class AudioConfiguration:
         self.frames_per_buffer = frames_per_buffer
         self.playout_chunk_size = playout_chunk_size
 
-
 class AudioStream:
     """
     Handles audio stream operations
@@ -75,15 +92,12 @@ class AudioStream:
     """
 
     def __init__(self, config: AudioConfiguration):
-        """
-        Args:
-            config (AudioConfiguration): Object containing audio settings.
-        """
         self.config = config
         self.stream = None
-        self.pyaudio_instance = pyaudio.PyAudio()
+        self.pyaudio_instance = pyaudio.PyAudio() if not is_colab else None
         self.actual_sample_rate = 0
         self.mpv_process = None
+        self.is_colab = is_colab
 
     def get_supported_sample_rates(self, device_index):
         """
@@ -176,6 +190,9 @@ class AudioStream:
 
     def open_stream(self):
         """Opens an audio stream."""
+        if self.is_colab:
+          self.actual_sample_rate = self.config.rate
+          return
 
         # check for mpeg format
         pyChannels = self.config.channels
@@ -403,10 +420,6 @@ class AudioBufferManager:
 
 
 class StreamPlayer:
-    """
-    Manages audio playback operations such as start, stop, pause, and resume.
-    """
-
     def __init__(
         self,
         audio_buffer: queue.Queue,
@@ -418,21 +431,7 @@ class StreamPlayer:
         on_word_spoken=None,
         muted=False,
     ):
-        """
-        Args:
-            audio_buffer (queue.Queue): Queue to be used as the audio buffer.
-            timings (queue.Queue): Queue for word timing information.
-            config (AudioConfiguration): Object containing audio settings.
-            on_playback_start (Callable, optional): Callback function to be
-              called at the start of playback. Defaults to None.
-            on_playback_stop (Callable, optional): Callback function to be
-              called at the stop of playback. Defaults to None.
-            on_audio_chunk (Callable, optional): Callback function called with
-              each audio chunk *after* effects and resampling, just before
-              being written to the output device/file. Defaults to None.
-            on_word_spoken (Callable, optional): Callback for word timing events.
-            muted (bool): Initial muted state.
-        """
+        self.is_colab = is_colab
         self.buffer_manager = AudioBufferManager(audio_buffer, timings, config)
         self.timings = timings
         self.timings_list = []
@@ -448,7 +447,8 @@ class StreamPlayer:
         self.first_chunk_played = False
         self.muted = muted
         self.seconds_played = 0
-
+        self.colab_audio_buffer = io.BytesIO() if is_colab else None
+      
     def _play_mpeg_chunk(self, chunk):
         """
         Plays a chunk of audio data using mpv.
@@ -569,6 +569,11 @@ class StreamPlayer:
         Args:
             chunk: Chunk of audio data to be played.
         """
+        if self.is_colab:
+            self.colab_audio_buffer.write(chunk)
+            if self.on_audio_chunk:
+                self.on_audio_chunk(chunk)
+            return
         # --- Handle Raw MPEG Stream (MPV) ---
         is_mpeg_stream = (
             self.audio_stream.config.format == pyaudio.paCustomFormat and
@@ -632,6 +637,26 @@ class StreamPlayer:
             immediate (bool): If True, stops playback immediately
               without waiting for buffer to empty.
         """
+        if self.is_colab and self.colab_audio_buffer.tell() > 0:
+            from IPython.display import Audio, display
+            data = self.colab_audio_buffer.getvalue()
+            try:
+                if self.config.format == pyaudio.paCustomFormat:
+                    audio = Audio(data=data, format='mp3', rate=self.audio_stream.actual_sample_rate)
+                else:
+                    import wave
+                    with io.BytesIO() as wav_buffer:
+                        with wave.open(wav_buffer, 'wb') as wav_file:
+                            wav_file.setnchannels(self.config.channels)
+                            wav_file.setsampwidth(2)  # Assume 16-bit
+                            wav_file.setframerate(self.audio_stream.actual_sample_rate)
+                            wav_file.writeframes(data)
+                        audio = Audio(data=wav_buffer.getvalue(), rate=self.audio_stream.actual_sample_rate)
+                display(audio)
+            except Exception as e:
+                logging.error(f"Error playing audio in Colab: {e}")
+            self.colab_audio_buffer = io.BytesIO()
+          
         if not self.playback_thread:
             logging.warn("No playback thread found, cannot stop playback")
             return
