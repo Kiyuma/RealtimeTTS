@@ -11,22 +11,57 @@ Converts text into real-time audio using one or more TTS engines. Key features i
 - Output Options: Plays audio live or writes to a WAV file.
 """
 
+# Colab detection
+is_colab = False
+try:
+    import google.colab
+    is_colab = True
+except ImportError:
+    pass
 
+#Conditional imports for Colab
+if not is_colab:
+    from pydub import AudioSegment
+    import struct
+    try:
+        import pyaudio._portaudio as pa
+    except ImportError:
+        print("Could not import the PyAudio C module 'pyaudio._portaudio'.")
+        raise
+    import pyaudio
+else:
+    #Dummy PyAudio implementation
+    class DummyPyAudio:
+        paInt16 = 1
+        paCustomFormat = 2
+        paFloat32 = 3
+        paInt32 = 4
+        paInt24 = 5
+        paInt8 = 6
+        paUInt8 = 7
+        paFramesPerBufferUnspecified = 0
+
+        class PyAudio:
+            def __init__(self): pass
+            def open(self, *args, **kwargs): pass
+            def get_device_info_by_index(self, index): return {'maxOutputChannels': 2, 'defaultSampleRate': 44100}
+            def get_default_output_device_info(self): return {'index': 0}
+            def is_format_supported(self, *args, **kwargs): return True
+            def get_format_from_width(self, width): return 1
+
+    pa = DummyPyAudio()
+    pyaudio = DummyPyAudio()
+
+#Rest of imports remain the same
 from .threadsafe_generators import CharIterator, AccumulatingThreadSafeGenerator
 from .stream_player import StreamPlayer, AudioConfiguration
 from typing import Union, Iterator, List
 from .engines import BaseEngine
-try:
-    import pyaudio._portaudio as pa
-except ImportError:
-    print("Could not import the PyAudio C module 'pyaudio._portaudio'.")
-    raise
 import stream2sentence as s2s
 import numpy as np
 import threading
 import traceback
 import logging
-import pyaudio
 import queue
 import time
 import wave
@@ -161,6 +196,7 @@ class TextToAudioStream:
         self.player = None
         self.play_lock = threading.Lock()
         self.is_playing_flag = False
+        self.is_colab = is_colab #Colab flag
 
         self._create_iterators()
 
@@ -204,6 +240,9 @@ class TextToAudioStream:
         # Extract stream information (format, channels, rate) from the engine
         format, channels, rate = self.engine.get_stream_info()
 
+        if self.is_colab and format == pyaudio.paCustomFormat:
+            rate = 22050  #efault sample rate for Colab playback
+            
         # Check if the engine doesn't support consuming generators directly
         config = AudioConfiguration(
             format,
@@ -639,6 +678,15 @@ class TextToAudioStream:
         """
         Stops the playback of the synthesized audio stream immediately.
         """
+        #Finalize Colab audio playback
+        if self.is_colab and hasattr(self, 'colab_audio_buffer'):
+            from IPython.display import Audio, display
+            self._finalize_colab_wav()
+            audio = Audio(self.colab_audio_buffer.getvalue(), 
+                         rate=self.engine.get_stream_info()[2])
+            display(audio)
+            del self.colab_audio_buffer
+            
         if self.engine:
             self.engine.stop()
 
@@ -699,6 +747,60 @@ class TextToAudioStream:
         if self.on_word_spoken:
             self.on_word_spoken(word)
 
+    def _handle_colab_wav(self, chunk):
+        if not hasattr(self, 'colab_audio_buffer'):
+            # Initialize buffer and write WAV header
+            self.colab_audio_buffer = io.BytesIO()
+            
+            # Get audio parameters from engine
+            _, num_channels, sample_rate = self.engine.get_stream_info()
+            bits_per_sample = 16  # Assuming 16-bit PCM
+            
+            # RIFF header
+            self.colab_audio_buffer.write(b'RIFF')
+            self.colab_audio_buffer.write(struct.pack('<I', 0))  # Placeholder for file size
+            self.colab_audio_buffer.write(b'WAVE')
+
+            # fmt subchunk
+            self.colab_audio_buffer.write(b'fmt ')
+            struct.pack_into('<IHHIIHH', 
+                self.colab_audio_buffer, 
+                self.colab_audio_buffer.tell(),
+                16,         # Subchunk size (16 for PCM)
+                1,          # Audio format (1 = PCM)
+                num_channels,
+                sample_rate,
+                sample_rate * num_channels * (bits_per_sample // 8),  # Byte rate
+                num_channels * (bits_per_sample // 8),  # Block align
+                bits_per_sample)
+            self.colab_audio_buffer.seek(20, io.SEEK_CUR)  # Skip 20 bytes written by pack_into
+
+            # data subchunk header
+            self.colab_audio_buffer.write(b'data')
+            self.colab_audio_buffer.write(struct.pack('<I', 0))  # Placeholder for data size
+
+        # Write actual PCM data
+        self.colab_audio_buffer.write(chunk)
+
+    def _finalize_colab_wav(self):
+        """Finalize WAV header with correct sizes"""
+        if hasattr(self, 'colab_audio_buffer'):
+            # Get current buffer size and data size
+            buffer = self.colab_audio_buffer
+            file_size = buffer.tell()
+            data_size = file_size - 44  # Subtract header size
+            
+            # Update RIFF chunk size (file size - 8)
+            buffer.seek(4)
+            buffer.write(struct.pack('<I', file_size - 8))
+            
+            # Update data subchunk size
+            buffer.seek(40)
+            buffer.write(struct.pack('<I', data_size))
+            
+            # Reset buffer position
+            buffer.seek(0)
+
     def _on_audio_chunk(self, chunk):
         """
         Postprocessing of single chunks of audio data.
@@ -708,7 +810,12 @@ class TextToAudioStream:
         Args:
             chunk (bytes): The audio data chunk to be processed.
         """
-        format, channels, sample_rate = self.engine.get_stream_info()
+        if not self.is_colab: #Skip format conversion if in Colab
+            format, channels, sample_rate = self.engine.get_stream_info()
+            if format == pyaudio.paFloat32:
+                audio_data = np.frombuffer(chunk, dtype=np.float32)
+                audio_data = np.int16(audio_data * 32767)
+                chunk = audio_data.tobytes()
 
         if format == pyaudio.paFloat32:
             audio_data = np.frombuffer(chunk, dtype=np.float32)
@@ -719,7 +826,13 @@ class TextToAudioStream:
             if self._is_engine_mpeg():
                 self.wf.write(chunk)
             else:
-                self.wf.writeframes(chunk)
+                if not self.is_colab:  # Normal WAV handling
+                    self.wf.writeframes(chunk)
+                else:  # Colab-specific WAV handling
+                    self._handle_colab_wav(chunk)
+
+        if self.chunk_callback:
+            self.chunk_callback(chunk)
 
         if self.chunk_callback:
             self.chunk_callback(chunk)
